@@ -7,8 +7,8 @@
 Для начала скачаем актуальную версию проекта:
 
 ```bash
-git clone https://github.com/nikikorolev/habr-parser.git
-cd habr-parser
+git clone https://github.com/nikikorolev/habr_parser.git
+cd habr_parser
 ```
 
 Синхронизируем зависимости с помощью `uv`:
