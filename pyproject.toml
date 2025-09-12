@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "habr-parser"
+version = "0.0.1"
+description = "Parsing habr articles"
+authors = [
+    {name = "Nikita Korolev", email = "niki.korolev@gmail.com"}
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.13.5",
+    "html5lib>=1.1",
+    "pandas>=2.3.2",
+    "pyarrow>=21.0.0",
+    "pydantic>=2.11.7",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.5",
+    "click>=8.1.0",
+]
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[project.scripts]
+habr-parser = "src.utils.cli:cli"
+
+[dependency-groups]
+dev = [
+    "black>=25.1.0",
+    "mypy>=1.17.1",
+    "ruff>=0.12.12",
+]
+
+[tool.setuptools]
+packages = {find = {}}
+package-dir = {"" = "."}
+
+[tool.mypy]
+python_version = "3.12"
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+warn_return_any = true
+exclude = ['.venv', 'venv']
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "requests.*",
+]
+ignore_missing_imports = true
+
+[tool.black]
+line-length = 120
+target-version = ['py312']
+preview = true
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+unfixable = ["F401", "E402"]
+select = ["ALL"]
+ignore = ["FBT001", "FBT002", "S608", "BLE001", "FIX002", "PLR0913", "PGH003", "RUF002", "PLC0415", "G004", "TD002", "TD003"]
