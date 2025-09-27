@@ -1,10 +1,14 @@
 """Модуль для парсинга статей с сайта Habr.com."""
 
+from __future__ import annotations
+
+import asyncio
 import logging
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import requests
+import aiohttp
 import yaml
 from bs4 import BeautifulSoup
 
@@ -14,136 +18,177 @@ from src.utils.export import Exporter
 from src.utils.logger import setup_logger
 
 if TYPE_CHECKING:
+    import types
+
     from src.models.config import HeadersConfig
 
-
 HTTP_OK: int = 200
-
-# TODO: доработки после обсуждения
-#   0. Асинхронность
-#   1. Парсинг комментариев
-#   2. Исправить алерты mypy
+HTTP_530: int = 530
+HTTP_TOO_MANY_REQUESTS: int = 429
 
 
 class HabrParser:
     """Парсер статей с сайта Habr.com.
 
-    Чтобы начать пользоватся парсером, нужно составить конфиг с помощью `ParserConfig`,
-    либо воспользоватся YAML-файликом. Для парсинга, воспользуйтесь методом `ingest`.
-
-
-    :cvar BASE_URL: базовый URL для статей Habr
+    :cvar BASE_URL: Базовый URL для статей Habr
     :vartype BASE_URL: str
-    :cvar BASE_CONFIG_PATH: путь к файлу конфигурации по умолчанию
+    :cvar BASE_CONFIG_PATH: Путь к файлу конфигурации по умолчанию
     :vartype BASE_CONFIG_PATH: Path
-    :cvar TIMEOUT: таймаут HTTP-запросов в секундах
-    :vartype TIMEOUT: int
-
-    :ivar config: конфигурация парсера
-    :vartype config: ParserConfig
-    :ivar log: логгер для записи событий
-    :vartype log: logging.Logger
     """
 
     BASE_URL: str = "https://habr.com/ru/articles/"
     BASE_CONFIG_PATH: Path = Path(__file__).parent.parent.joinpath("config.yaml")
-    TIMEOUT: int = 10
 
     def __init__(self, config_path: str | Path | None = None) -> None:
-        """Инициализация параметров."""
+        """Инициализация параметров.
+
+        :param config_path: Путь к файлу конфигурации
+        :type config_path: str | Path | None
+        """
         path = Path(config_path) if config_path else self.BASE_CONFIG_PATH
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        self.config = ParserConfig(**data)
+        self.config: ParserConfig = ParserConfig(**data)
         setup_logger(self.config.logging)
-        self.log = logging.getLogger(__name__)
-        init_message = "HabrParser initialized"
-        self.log.info(init_message)
+        self.log: logging.Logger = logging.getLogger(__name__)
+        self.session: aiohttp.ClientSession | None = None
+        self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.config.request.max_concurrent_requests)
+        self.last_request_time: float = 0
+        self.request_count: int = 0
+        self.log.info("HabrParser initialized")
+
+    async def __aenter__(self) -> HabrParser:
+        """Асинхронный контекстный менеджер для инициализации сессии.
+
+        :return: Экземпляр парсера
+        :rtype: HabrParser
+        """
+        await self.init_session()
+        return self
+
+    async def __aexit__(self,
+                    exc_type: type[BaseException] | None,
+                    exc_val: BaseException | None,
+                    exc_tb: types.TracebackType | None,
+                   ) -> bool | None:
+        """Асинхронный контекстный менеджер для закрытия сессии.
+
+        :param exc_type: Тип исключения
+        :type exc_type: type[BaseException] | None
+        :param exc_val: Значение исключения
+        :type exc_val: BaseException | None
+        :param exc_tb: Трассировка исключения
+        :type exc_tb: types.TracebackType | None
+        :return: Флаг обработки исключения
+        :rtype: bool | None
+        """
+        await self.close_session()
+        return None
+
+    async def init_session(self) -> None:
+        """Инициализирует HTTP-сессию с настройками соединения."""
+        if self.session is None or self.session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=self.config.request.session.limit,
+                limit_per_host=self.config.request.session.limit_per_host,
+                ttl_dns_cache=self.config.request.session.ttl_dns_cache,
+                force_close=self.config.request.session.force_close,
+            )
+            self.session = aiohttp.ClientSession(
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=self.config.request.timeout),
+                connector=connector,
+            )
+            self.log.debug("Session initialized with rate limiting")
+
+    async def close_session(self) -> None:
+        """Закрывает HTTP-сессию."""
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     @property
     def save_path(self) -> Path:
-        """Путь для файла сохранения данных.
+        """Возвращает путь для сохранения данных.
 
-        :return: путь для сохранения файлов
+        :return: Путь для сохранения
         :rtype: Path
         """
         return self.config.save.get_path()
 
     @property
     def headers(self) -> dict[str, str | None]:
-        """Формирует заголовки HTTP-запросов.
+        """Возвращает заголовки HTTP-запросов.
 
-        :return: словарь с заголовками запросов
+        :return: Словарь заголовков
         :rtype: dict[str, str | None]
         """
         headers_config: HeadersConfig | None = self.config.headers
         return headers_config.build_headers() if headers_config else {}
 
-    def fetch_post(self, post_id: int) -> str:
-        """Получает HTML-контент статьи по идентификатору.
+    async def __delay_request(self) -> None:
+        """Добавляет случайную задержку между запросами."""
+        await asyncio.sleep(random.uniform(self.config.request.min_delay, self.config.request.max_delay))  # noqa: S311
 
-        :param post_id: идентификатор статьи
+    async def fetch_post(self, post_id: int) -> str:
+        """Получает HTML-контент с retry и задержками.
+
+        :param post_id: ID статьи для получения
         :type post_id: int
         :return: HTML-контент статьи
         :rtype: str
-        :raises FetchPostError: если произошла ошибка при получении статьи
+        :raises FetchPostError: Если не удалось получить статью после всех попыток
         """
-        debug_message = f"Fetching post {post_id}"
-        self.log.debug(debug_message)
-        url = f"{self.BASE_URL}{post_id}"
-        try:
-            response = requests.get(
-                url,
-                timeout=self.TIMEOUT,
-                headers=self.headers,
-            )
-        except requests.RequestException as e:
-            error_message = f"Request error for post {post_id}: {e}"
-            self.log.exception(error_message)
-            raise FetchPostError(post_id, str(e)) from e
+        async with self.semaphore:
+            await self.__delay_request()
 
-        if response.status_code == HTTP_OK:
-            success_message = f"Successfully fetched post {post_id}"
-            self.log.debug(success_message)
-            text: str = response.text
-            return text
-        warning_message = f"Failed to fetch post {post_id}: HTTP status {response.status_code}"
-        self.log.warning(warning_message)
-        raise FetchPostError(post_id, response.status_code)
+            url = f"{self.BASE_URL}{post_id}"
+            self.log.info(f"Fetching post {post_id}")
+
+            for attempt in range(self.config.request.retry_attempts):
+                try:
+                    async with self.session.get(url) as response:
+                        if response.status == HTTP_OK:
+                            text = await response.text()
+                            self.log.info(f"Successfully fetched post {post_id}")
+                            return text
+                        if response.status == HTTP_530:
+                            self.log.warning(f"503 error for post {post_id}, attempt {attempt + 1}")
+                            await self.__delay_request()
+                            continue
+                        if response.status == HTTP_TOO_MANY_REQUESTS:
+                            self.log.warning(f"429 Rate Limited for post {post_id}")
+                            await self.__delay_request()
+                            continue
+                        error_message = f"HTTP {response.status}"
+                        raise FetchPostError(post_id, error_message)
+
+                except aiohttp.ClientError as e:
+                    self.log.warning(f"Client error, retrying: {e!s}")
+                    await self.__delay_request()
+
+            error_message = "Max retries exceeded"
+            raise FetchPostError(post_id, error_message)
 
     def parse_post(self, text: str) -> dict[str, Any]:
-        """Парсит HTML-контент статьи и извлекает данные.
+        """Парсит HTML-контент статьи.
 
         :param text: HTML-контент статьи
         :type text: str
-        :return: словарь с извлеченными данными статьи
+        :return: Словарь с распарсенными данными статьи
         :rtype: dict[str, Any]
         """
-        debug_message = "Parsing post content"
-        self.log.debug(debug_message)
-        soup = BeautifulSoup(text, "html5lib")
+        soup = BeautifulSoup(text, "lxml")
         data: dict[str, Any] = {}
 
         if not soup.find("div", {"id": "post-content-body"}):
             data["status"] = "not_found"
-            not_found_message = "Post content not found"
-            self.log.debug(not_found_message)
         else:
             data["status"] = "ok"
-            content_found_message = "Post content found, extracting data"
-            self.log.debug(content_found_message)
-
             title = soup.find("title")
             data["title"] = title.get_text(strip=True) if title else None
-            if not data["title"]:
-                title_warning = "Title not found in post"
-                self.log.warning(title_warning)
 
             article = soup.find("div", {"class": "article-formatted-body"})
             data["text"] = article.get_text(strip=True) if article else None
-            if not data["text"]:
-                text_warning = "Article text not found"
-                self.log.warning(text_warning)
 
             keywords = soup.find("meta", attrs={"name": "keywords"})
             keywords_content = keywords.get("content") if keywords else None
@@ -163,76 +208,61 @@ class HabrParser:
 
         return data
 
-    def get_post_data(self, post_id: int) -> dict[str, Any]:
-        """Обрабатывает статью по идентификатору и возвращает данные в виде словаря.
+    async def get_post_data(self, post_id: int) -> dict[str, Any]:
+        """Обрабатывает статью с обработкой ошибок.
 
-        Словарь имеет вид следующие ключи:
-            status - статус обработки страницы
-            title - название статьи
-            text - текст статьи
-            keywords - ключевые слова
-            username - имя автора статьи
-            user_bio - описания профиля автора статьи
-            hubs - хабы
-
-        :param post_id: идентификатор статьи
+        :param post_id: ID статьи для обработки
         :type post_id: int
-        :return: словарь с данными статьи
+        :return: Словарь с данными статьи или информацией об ошибке
         :rtype: dict[str, Any]
         """
-        info_message = f"Processing post {post_id}"
-        self.log.info(info_message)
-        data: dict[str, Any] = {}
         try:
-            text = self.fetch_post(post_id)
+            text = await self.fetch_post(post_id)
             data = self.parse_post(text)
-            status_message = f"Successfully processed post {post_id}, status: {data.get('status')}"
-            self.log.info(status_message)
         except FetchPostError as e:
-            data["status"] = "fetch_post_error"
-            fetch_error_message = f"Failed to process post {post_id}, error: {e!s}"
-            self.log.error(fetch_error_message)  # noqa: TRY400
+            self.log.error(f"Failed to fetch post {post_id}: {e}")  # noqa: TRY400
+            return {"id": post_id, "status": "fetch_error", "error": str(e)}
         except Exception as e:
-            data["status"] = "parse_error"
-            parse_error_message = f"Unexpected error processing post {post_id}, error: {e!s}"
-            self.log.error(parse_error_message)  # noqa: TRY400
+            self.log.error(f"Unexpected error for post {post_id}: {e}")  # noqa: TRY400
+            return {"id": post_id, "status": "error", "error": str(e)}
+        else:
+            data["id"] = post_id
+            return data
 
-        data["id"] = post_id
-        return data
-
-    def ingest_all(self) -> None:
-        """Осуществляет парсинг всех статей в указанном диапазоне."""
-        wrong_statuses = ["not_found", "fetch_post_error", "parse_error"]
+    async def ingest_all(self) -> None:
+        """Основной метод парсинга с улучшенным управлением скоростью."""
         pages = self.config.pages
         first, last = pages.first, pages.last
+        self.log.info(f"Starting parsing from {first} to {last}!")
+        exporter = Exporter(
+            self.save_path,
+            max_workers=self.config.request.max_workers,
+            buffer_size=self.config.request.buffer_size,
+            )
 
-        start_message = f"Starting parsing posts from {first} to {last}"
-        self.log.info(start_message)
-        exporter = Exporter(self.save_path)
+        try:
+            await self.init_session()
+            batch_size = self.config.request.batch_size
+            all_post_ids = list(range(first, last + 1))
 
-        for post_id in range(first, last + 1):
-            if post_id % 100 == 0:
-                progress_message = f"Process {post_id} posts out of {last - first + 1}"
-                self.log.info(progress_message)
-            post_data = self.get_post_data(post_id)
-            if self.config.save.skip and post_data.get("status") in wrong_statuses:
-                skip_message = f"Skipping post {post_id} due to status: {post_data.get('status')}"
-                self.log.debug(skip_message)
-                continue
-            try:
-                exporter.save_chunk(post_data)
-            except Exception:
-                save_error_message = "Saving error"
-                self.log.exception(save_error_message)
-                continue
-            success_message = f"Successfully saved post with {post_id}."
-            self.log.info(success_message)
+            for i in range(0, len(all_post_ids), batch_size):
+                batch_ids = all_post_ids[i:i + batch_size]
 
-        exporter.finalize()
-        finish_message = f"Finished parsing {last - first + 1} posts"
-        self.log.info(finish_message)
+                tasks = [self.get_post_data(pid) for pid in batch_ids]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                for result in results:
+                    if isinstance(result, BaseException):
+                        continue
+                    if not self.config.save.skip or result.get("status") == "ok":
+                        await exporter.save_chunk(result)
 
-if __name__ == "__main__":
-    parser = HabrParser()
-    parser.ingest_all()
+                self.log.info(f"Processed {min(i + batch_size, len(all_post_ids))}/{len(all_post_ids)}")
+
+                if i + batch_size < len(all_post_ids):
+                    await self.__delay_request()
+        finally:
+            await self.close_session()
+            await exporter.finalize()
+
+        self.log.info("Parsing completed")
