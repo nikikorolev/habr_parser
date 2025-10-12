@@ -204,9 +204,6 @@ class HabrParser:
                 hubs.append(hub_name)
             data["hubs"] = hubs
 
-            user_bio = soup.find("p", {"data-test-id": "user-card-speciality"})
-            data["user_bio"] = user_bio.get_text(strip=True) if user_bio else None
-
             time = soup.find("time")
             data["time"] = datetime.fromisoformat(
                 time.get("datetime").replace("Z", "+00:00"),
