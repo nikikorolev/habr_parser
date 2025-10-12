@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -205,6 +206,14 @@ class HabrParser:
 
             user_bio = soup.find("p", {"data-test-id": "user-card-speciality"})
             data["user_bio"] = user_bio.get_text(strip=True) if user_bio else None
+
+            time = soup.find("time")
+            data["time"] = datetime.fromisoformat(
+                time.get("datetime").replace("Z", "+00:00"),
+                ).strftime("%Y-%m-%d %H:%M:%S") if time else None
+
+            reading_time = soup.find("span", {"class": "tm-article-reading-time__label"})
+            data["reading_time"] = reading_time.get_text(strip=True)[:-4] if reading_time else None
 
         return data
 
