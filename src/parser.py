@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -170,6 +172,25 @@ class HabrParser:
             error_message = "Max retries exceeded"
             raise FetchPostError(post_id, error_message)
 
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Экранирует символы в тексте.
+
+        :param text: HTML-контент статьи
+        :type text: str
+        """
+        if not text:
+            return ""
+        text = html.unescape(str(text))
+        text = re.sub(r"[\r\n]+", " ", text)
+        text = re.sub(r"\t+", " ", text)
+        text = text.replace('"', '""')
+        text = re.sub(r"[„“”«»]", '"', text)
+        text = re.sub(r"[ ]+", " ", text)
+        text = text.replace("\\", "/")
+
+        return text.strip()
+
     def parse_post(self, text: str) -> dict[str, Any]:
         """Парсит HTML-контент статьи.
 
@@ -189,7 +210,7 @@ class HabrParser:
             data["title"] = title.get_text(strip=True) if title else None
 
             article = soup.find("div", {"class": "article-formatted-body"})
-            data["text"] = article.get_text(strip=True) if article else None
+            data["text"] = self.clean_text(article.get_text(strip=True)) if article else None
 
             keywords = soup.find("meta", attrs={"name": "keywords"})
             keywords_content = keywords.get("content") if keywords else None
